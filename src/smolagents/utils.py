@@ -404,7 +404,8 @@ def get_source(obj) -> str:
         ValueError: If source cannot be found in IPython history
 
     Note:
-        TODO: handle Python standard REPL
+        Attempts to retrieve the source from the current IPython session and,
+        if not available, falls back to the standard ``readline`` history.
     """
     if not (isinstance(obj, type) or callable(obj)):
         raise TypeError(f"Expected class or callable, got {type(obj)}")
@@ -433,7 +434,26 @@ def get_source(obj) -> str:
                 return dedent("\n".join(all_cells.split("\n")[node.lineno - 1 : node.end_lineno])).strip()
         raise ValueError(f"Could not find source code for {obj.__name__} in IPython history")
     except ImportError:
-        # IPython is not available, let's just raise the original inspect error
+        # No IPython shell, try the standard Python REPL history as a fallback
+        try:
+            import readline
+
+            history_file = os.path.expanduser("~/.python_history")
+            if os.path.exists(history_file):
+                readline.read_history_file(history_file)
+                history = "\n".join(
+                    readline.get_history_item(i + 1)
+                    for i in range(readline.get_current_history_length())
+                    if readline.get_history_item(i + 1)
+                )
+                tree = ast.parse(history)
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name == obj.__name__:
+                        lines = history.splitlines()[node.lineno - 1 : node.end_lineno]
+                        return dedent("\n".join(lines)).strip()
+        except Exception:
+            pass
+        # Fall back to raising the original inspect error
         raise inspect_error
     except ValueError as e:
         # IPython is available but we couldn't find the source code, let's raise the error
