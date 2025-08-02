@@ -15,10 +15,10 @@
 
 import unittest
 
+import PIL.Image
 import pytest
 
 from smolagents import (
-    AgentImage,
     CodeAgent,
     RunResult,
     ToolCallingAgent,
@@ -42,7 +42,7 @@ class FakeLLMModel(Model):
         if tools_to_call_from is not None:
             return ChatMessage(
                 role=MessageRole.ASSISTANT,
-                content="",
+                content="I will call the final_answer tool.",
                 tool_calls=[
                     ChatMessageToolCall(
                         id="fake_id",
@@ -144,6 +144,7 @@ class MonitoringTester(unittest.TestCase):
             tools=[],
             model=FakeLLMModel(),
             max_steps=1,
+            verbosity_level=100,
         )
 
         # Use stream_to_gradio to capture the output
@@ -151,15 +152,14 @@ class MonitoringTester(unittest.TestCase):
             stream_to_gradio(
                 agent,
                 task="Test task",
-                additional_args=dict(image=AgentImage(value="path.png")),
+                additional_args=dict(image=PIL.Image.new("RGB", (100, 100))),
             )
         )
 
-        self.assertEqual(len(outputs), 6)
+        self.assertEqual(len(outputs), 7)
         final_message = outputs[-1]
         self.assertEqual(final_message.role, "assistant")
         self.assertIsInstance(final_message.content, dict)
-        self.assertEqual(final_message.content["path"], "path.png")
         self.assertEqual(final_message.content["mime_type"], "image/png")
 
     def test_streaming_with_agent_error(self):

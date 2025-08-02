@@ -39,6 +39,7 @@ from smolagents.agent_types import AgentImage, AgentText
 from smolagents.agents import (
     AgentError,
     AgentMaxStepsError,
+    AgentToolCallError,
     CodeAgent,
     MultiStepAgent,
     ToolCall,
@@ -49,7 +50,11 @@ from smolagents.agents import (
 from smolagents.default_tools import DuckDuckGoSearchTool, FinalAnswerTool, PythonInterpreterTool, VisitWebpageTool
 from smolagents.memory import (
     ActionStep,
+    CallbackRegistry,
+    FinalAnswerStep,
+    MemoryStep,
     PlanningStep,
+    SystemPromptStep,
     TaskStep,
 )
 from smolagents.models import (
@@ -61,13 +66,12 @@ from smolagents.models import (
     Model,
     TransformersModel,
 )
-from smolagents.monitoring import AgentLogger, LogLevel, TokenUsage
+from smolagents.monitoring import AgentLogger, LogLevel, Timing, TokenUsage
 from smolagents.tools import Tool, tool
 from smolagents.utils import (
     BASE_BUILTIN_MODULES,
     AgentExecutionError,
     AgentGenerationError,
-    AgentToolCallError,
     AgentToolExecutionError,
 )
 
@@ -112,7 +116,7 @@ class FakeToolCallModel(Model):
         if len(messages) < 3:
             return ChatMessage(
                 role=MessageRole.ASSISTANT,
-                content="",
+                content="I will call the python interpreter.",
                 tool_calls=[
                     ChatMessageToolCall(
                         id="call_0",
@@ -126,7 +130,7 @@ class FakeToolCallModel(Model):
         else:
             return ChatMessage(
                 role=MessageRole.ASSISTANT,
-                content="",
+                content="I will return the final answer.",
                 tool_calls=[
                     ChatMessageToolCall(
                         id="call_1",
@@ -222,6 +226,31 @@ result = 2**3.6452
 Thought: I can now answer the initial question
 <code>
 final_answer(7.2904)
+</code>
+""",
+            )
+
+
+class FakeCodeModelImageGeneration(Model):
+    def generate(self, messages, stop_sequences=None):
+        prompt = str(messages)
+        if "special_marker" not in prompt:
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content="""
+Thought: I should generate an image. special_marker
+<code>
+image = image_generation_tool()
+</code>
+""",
+            )
+        else:  # We're at step 2
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content="""
+Thought: I can now answer the initial question
+<code>
+final_answer(image)
 </code>
 """,
             )
@@ -392,7 +421,7 @@ class TestAgent:
         assert "7.2904" in output
         assert agent.memory.steps[0].task == "What is 2 multiplied by 3.6452?"
         assert "7.2904" in agent.memory.steps[1].observations
-        assert agent.memory.steps[2].model_output == "Called Tool: 'final_answer' with arguments: {'answer': '7.2904'}"
+        assert agent.memory.steps[2].model_output == "I will return the final answer."
 
     def test_toolcalling_agent_handles_image_tool_outputs(self, shared_datadir):
         import PIL.Image
@@ -409,7 +438,9 @@ class TestAgent:
 
             return PIL.Image.open(shared_datadir / "000000039769.png")
 
-        agent = ToolCallingAgent(tools=[fake_image_generation_tool], model=FakeToolCallModelImage())
+        agent = ToolCallingAgent(
+            tools=[fake_image_generation_tool], model=FakeToolCallModelImage(), verbosity_level=10
+        )
         output = agent.run("Make me an image.")
         assert isinstance(output, AgentImage)
         assert isinstance(agent.state["image.png"], PIL.Image.Image)
@@ -434,7 +465,7 @@ class TestAgent:
         assert output == "The image is a cat."
 
     def test_fake_code_agent(self):
-        agent = CodeAgent(tools=[PythonInterpreterTool()], model=FakeCodeModel())
+        agent = CodeAgent(tools=[PythonInterpreterTool()], model=FakeCodeModel(), verbosity_level=10)
         output = agent.run("What is 2 multiplied by 3.6452?")
         assert isinstance(output, float)
         assert output == 7.2904
@@ -535,6 +566,7 @@ class TestAgent:
             model=FakeCodeModelFunctionDef(),
             max_steps=2,
             additional_authorized_imports=["numpy"],
+            verbosity_level=100,
         )
         res = agent.run("ok")
         assert res[0] == 0.5
@@ -580,7 +612,6 @@ class TestAgent:
         agent.replay()
 
         str_output = agent_logger.console.export_text()
-        assert "Called Tool" in str_output
         assert "arguments" in str_output
 
     def test_code_nontrivial_final_answer_works(self):
@@ -603,7 +634,7 @@ nested_answer()
 
     def test_transformers_toolcalling_agent(self):
         @tool
-        def weather_api(location: str, celsius: bool = False) -> str:
+        def weather_api(location: str, celsius: str = "") -> str:
             """
             Gets the weather in the next days at given location.
             Secretly this tool does not care about the location, it hates the weather everywhere.
@@ -837,6 +868,176 @@ class TestMultiStepAgent:
 
         # assert "read-only" in str(exc_info.value)
         # assert "Use 'self.prompt_templates[\"system_prompt\"]' instead" in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "step_callbacks, expected_registry_state",
+        [
+            # Case 0: None as input (initializes empty registry)
+            (
+                None,
+                {
+                    "MemoryStep": 0,
+                    "ActionStep": 1,
+                    "PlanningStep": 0,
+                    "TaskStep": 0,
+                    "SystemPromptStep": 0,
+                    "FinalAnswerStep": 0,
+                },  # Only monitor.update_metrics is registered for ActionStep
+            ),
+            # Case 1: List of callbacks (registers only for ActionStep: backward compatibility)
+            (
+                [MagicMock(), MagicMock()],
+                {
+                    "MemoryStep": 0,
+                    "ActionStep": 3,
+                    "PlanningStep": 0,
+                    "TaskStep": 0,
+                    "SystemPromptStep": 0,
+                    "FinalAnswerStep": 0,
+                },
+            ),
+            # Case 2: Dict mapping specific step types to callbacks
+            (
+                {ActionStep: MagicMock(), PlanningStep: MagicMock()},
+                {
+                    "MemoryStep": 0,
+                    "ActionStep": 2,
+                    "PlanningStep": 1,
+                    "TaskStep": 0,
+                    "SystemPromptStep": 0,
+                    "FinalAnswerStep": 0,
+                },
+            ),
+            # Case 3: Dict with list of callbacks for a step type
+            (
+                {ActionStep: [MagicMock(), MagicMock()]},
+                {
+                    "MemoryStep": 0,
+                    "ActionStep": 3,
+                    "PlanningStep": 0,
+                    "TaskStep": 0,
+                    "SystemPromptStep": 0,
+                    "FinalAnswerStep": 0,
+                },
+            ),
+            # Case 4: Dict with mixed single and list callbacks
+            (
+                {ActionStep: MagicMock(), MemoryStep: [MagicMock(), MagicMock()]},
+                {
+                    "MemoryStep": 2,
+                    "ActionStep": 2,
+                    "PlanningStep": 0,
+                    "TaskStep": 0,
+                    "SystemPromptStep": 0,
+                    "FinalAnswerStep": 0,
+                },
+            ),
+        ],
+    )
+    def test_setup_step_callbacks(self, step_callbacks, expected_registry_state):
+        """Test that _setup_step_callbacks correctly sets up the callback registry."""
+        # Create a dummy agent
+        agent = DummyMultiStepAgent(tools=[], model=MagicMock())
+        # Mock the monitor
+        agent.monitor = MagicMock()
+
+        # Call the method
+        agent._setup_step_callbacks(step_callbacks)
+
+        # Check that step_callbacks is a CallbackRegistry
+        assert isinstance(agent.step_callbacks, CallbackRegistry)
+
+        # Count callbacks for each step type
+        actual_registry_state = {}
+        for step_type in [MemoryStep, ActionStep, PlanningStep, TaskStep, SystemPromptStep, FinalAnswerStep]:
+            callbacks = agent.step_callbacks._callbacks.get(step_type, [])
+            actual_registry_state[step_type.__name__] = len(callbacks)
+
+        # Verify registry state matches expected
+        assert actual_registry_state == expected_registry_state
+
+    def test_finalize_step_callbacks_with_list(self):
+        # Create mock callbacks
+        callback1 = MagicMock()
+        callback2 = MagicMock()
+
+        # Create a test agent with a list of callbacks
+        agent = DummyMultiStepAgent(tools=[], model=MagicMock(), step_callbacks=[callback1, callback2])
+
+        # Create steps of different types
+        action_step = ActionStep(step_number=1, timing=Timing(start_time=0.0))
+        planning_step = PlanningStep(
+            timing=Timing(start_time=1.0),
+            model_input_messages=[],
+            model_output_message=ChatMessage(role="assistant", content="Test plan"),
+            plan="Test planning step",
+        )
+
+        # Test with ActionStep
+        agent._finalize_step(action_step)
+
+        # Verify all callbacks were called
+        callback1.assert_called_once_with(action_step, agent=agent)
+        callback2.assert_called_once_with(action_step, agent=agent)
+
+        # Reset mocks
+        callback1.reset_mock()
+        callback2.reset_mock()
+
+        # Test with PlanningStep
+        agent._finalize_step(planning_step)
+
+        # Verify all callbacks were called again with the planning step
+        callback1.assert_not_called()
+        callback2.assert_not_called()
+
+    def test_finalize_step_callbacks_by_type(self):
+        # Create mock callbacks for different step types
+        action_step_callback = MagicMock()
+        action_step_callback_2 = MagicMock()
+        planning_step_callback = MagicMock()
+        step_callback = MagicMock()
+
+        # Register callbacks for different step types
+        step_callbacks = {
+            ActionStep: [action_step_callback, action_step_callback_2],
+            PlanningStep: planning_step_callback,
+            MemoryStep: step_callback,
+        }
+        agent = DummyMultiStepAgent(tools=[], model=MagicMock(), step_callbacks=step_callbacks)
+
+        # Create steps of different types
+        action_step = ActionStep(step_number=1, timing=Timing(start_time=0.0))
+        planning_step = PlanningStep(
+            timing=Timing(start_time=1.0),
+            model_input_messages=[],
+            model_output_message=ChatMessage(role="assistant", content="Test plan"),
+            plan="Test planning step",
+        )
+
+        # Test with ActionStep
+        agent._finalize_step(action_step)
+
+        # Verify correct callbacks were called
+        action_step_callback.assert_called_once_with(action_step, agent=agent)
+        action_step_callback_2.assert_called_once_with(action_step, agent=agent)
+        step_callback.assert_called_once_with(action_step, agent=agent)
+        planning_step_callback.assert_not_called()
+
+        # Reset mocks
+        action_step_callback.reset_mock()
+        action_step_callback_2.reset_mock()
+        planning_step_callback.reset_mock()
+        step_callback.reset_mock()
+
+        # Test with PlanningStep
+        agent._finalize_step(planning_step)
+
+        # Verify correct callbacks were called
+        planning_step_callback.assert_called_once_with(planning_step, agent=agent)
+        step_callback.assert_called_once_with(planning_step, agent=agent)
+        action_step_callback.assert_not_called()
+        action_step_callback_2.assert_not_called()
 
     def test_logs_display_thoughts_even_if_error(self):
         class FakeJsonModelNoCall(Model):
@@ -1169,6 +1370,74 @@ class TestMultiStepAgent:
             agent = DummyMultiStepAgent.from_dict(agent_dict, max_steps=30)
         assert agent.max_steps == 30
 
+    def test_multiagent_to_dict_from_dict_roundtrip(self):
+        """Test that to_dict() and from_dict() work correctly for agents with managed agents."""
+        # Create a managed agent
+        managed_agent = CodeAgent(
+            tools=[], model=MagicMock(), name="managed_agent", description="A managed agent for testing", max_steps=5
+        )
+
+        # Create a main agent with the managed agent
+        main_agent = ToolCallingAgent(
+            tools=[],
+            managed_agents=[managed_agent],
+            model=MagicMock(),
+            name="main_agent",
+            description="Main agent with managed agents",
+            max_steps=10,
+        )
+
+        # Convert to dict
+        agent_dict = main_agent.to_dict()
+
+        # Verify managed_agents structure in dict
+        assert "managed_agents" in agent_dict
+        assert isinstance(agent_dict["managed_agents"], list)
+        assert len(agent_dict["managed_agents"]) == 1
+
+        managed_agent_dict = agent_dict["managed_agents"][0]
+        assert managed_agent_dict["name"] == "managed_agent"
+        assert managed_agent_dict["class"] == "CodeAgent"
+        assert managed_agent_dict["description"] == "A managed agent for testing"
+        assert managed_agent_dict["max_steps"] == 5
+
+        # Test round-trip: from_dict should recreate the agent
+        # Mock the model classes directly instead of patching smolagents.models.MagicMock
+        with patch("smolagents.agents.importlib.import_module") as mock_import:
+            # Mock the models module
+            mock_models_module = MagicMock()
+            mock_model_class = MagicMock()
+            mock_model_instance = MagicMock()
+            mock_model_class.from_dict.return_value = mock_model_instance
+            mock_models_module.MagicMock = mock_model_class
+
+            # Mock the agents module
+            mock_agents_module = MagicMock()
+            mock_agents_module.CodeAgent = CodeAgent
+            mock_agents_module.ToolCallingAgent = ToolCallingAgent
+
+            def side_effect(module_name):
+                if module_name == "smolagents.models":
+                    return mock_models_module
+                elif module_name == "smolagents.agents":
+                    return mock_agents_module
+                return MagicMock()
+
+            mock_import.side_effect = side_effect
+
+            recreated_agent = ToolCallingAgent.from_dict(agent_dict)
+
+        # Verify the recreated agent has the same structure
+        assert recreated_agent.name == "main_agent"
+        assert recreated_agent.description == "Main agent with managed agents"
+        assert recreated_agent.max_steps == 10
+        assert len(recreated_agent.managed_agents) == 1
+
+        recreated_managed_agent = list(recreated_agent.managed_agents.values())[0]
+        assert recreated_managed_agent.name == "managed_agent"
+        assert recreated_managed_agent.description == "A managed agent for testing"
+        assert recreated_managed_agent.max_steps == 5
+
 
 class TestToolCallingAgent:
     def test_toolcalling_agent_instructions(self):
@@ -1256,7 +1525,7 @@ class TestToolCallingAgent:
         assert agent.memory.steps[1].observations == "The weather in Paris on date:today is sunny."
 
     @patch("openai.OpenAI")
-    def test_toolcalling_agent_stream_outputs_multiple_tool_calls(self, mock_openai_client):
+    def test_toolcalling_agent_stream_outputs_multiple_tool_calls(self, mock_openai_client, test_tool):
         """Test that ToolCallingAgent with stream_outputs=True returns the first final_answer when multiple are called."""
         mock_client = mock_openai_client.return_value
         from smolagents import OpenAIServerModel
@@ -1294,16 +1563,16 @@ class TestToolCallingAgent:
                     ChoiceDeltaToolCall(
                         index=1,
                         id="call_2",
-                        function=ChoiceDeltaToolCallFunction(name="final_answer"),
+                        function=ChoiceDeltaToolCallFunction(name="test_tool"),
                         type="function",
                     )
                 ]
             ),
             ChoiceDelta(
-                tool_calls=[ChoiceDeltaToolCall(index=1, function=ChoiceDeltaToolCallFunction(arguments='{"an'))]
+                tool_calls=[ChoiceDeltaToolCall(index=1, function=ChoiceDeltaToolCallFunction(arguments='{"in'))]
             ),
             ChoiceDelta(
-                tool_calls=[ChoiceDeltaToolCall(index=1, function=ChoiceDeltaToolCallFunction(arguments='swer"'))]
+                tool_calls=[ChoiceDeltaToolCall(index=1, function=ChoiceDeltaToolCallFunction(arguments='put"'))]
             ),
             ChoiceDelta(
                 tool_calls=[ChoiceDeltaToolCall(index=1, function=ChoiceDeltaToolCallFunction(arguments=': "out'))]
@@ -1334,13 +1603,13 @@ class TestToolCallingAgent:
 
         model = OpenAIServerModel(model_id="fakemodel")
 
-        agent = ToolCallingAgent(model=model, tools=[], max_steps=1, stream_outputs=True, verbosity_level=100)
+        agent = ToolCallingAgent(model=model, tools=[test_tool], max_steps=1, stream_outputs=True)
         result = agent.run("Make 2 calls to final answer: return both 'output1' and 'output2'")
         assert len(agent.memory.steps[-1].model_output_message.tool_calls) == 2
         assert agent.memory.steps[-1].model_output_message.tool_calls[0].function.name == "final_answer"
-        assert agent.memory.steps[-1].model_output_message.tool_calls[1].function.name == "final_answer"
+        assert agent.memory.steps[-1].model_output_message.tool_calls[1].function.name == "test_tool"
 
-        # The agent should return the first final_answer result
+        # The agent should return the final answer call
         assert result == "output1"
 
     @patch("huggingface_hub.InferenceClient")
@@ -1369,6 +1638,10 @@ class TestToolCallingAgent:
         assert "Error while parsing" in capture.get()
         assert len(agent.memory.steps) == 4
 
+    @pytest.mark.skip(
+        reason="Test is not properly implemented (GH-1255) because fake_tools should have the same name. "
+        "Additionally, it uses CodeAgent instead of ToolCallingAgent (GH-1409)"
+    )
     def test_change_tools_after_init(self):
         from smolagents import tool
 
@@ -1394,7 +1667,7 @@ class TestToolCallingAgent:
         answer = agent.run("Fake task.")
         assert answer == "2CUSTOM"
 
-    def test_custom_final_answer_with_custom_inputs(self):
+    def test_custom_final_answer_with_custom_inputs(self, test_tool):
         class CustomFinalAnswerToolWithCustomInputs(FinalAnswerTool):
             inputs = {
                 "answer1": {"type": "string", "description": "First part of the answer."},
@@ -1402,7 +1675,7 @@ class TestToolCallingAgent:
             }
 
             def forward(self, answer1: str, answer2: str) -> str:
-                return answer1 + "CUSTOM" + answer2
+                return answer1 + " and " + answer2
 
         model = MagicMock()
         model.generate.return_value = ChatMessage(
@@ -1415,12 +1688,19 @@ class TestToolCallingAgent:
                     function=ChatMessageToolCallFunction(
                         name="final_answer", arguments={"answer1": "1", "answer2": "2"}
                     ),
-                )
+                ),
+                ChatMessageToolCall(
+                    id="call_1",
+                    type="function",
+                    function=ChatMessageToolCallFunction(name="test_tool", arguments={"input": "3"}),
+                ),
             ],
         )
-        agent = ToolCallingAgent(tools=[CustomFinalAnswerToolWithCustomInputs()], model=model)
+        agent = ToolCallingAgent(tools=[test_tool, CustomFinalAnswerToolWithCustomInputs()], model=model)
         answer = agent.run("Fake task.")
-        assert answer == "1CUSTOM2"
+        assert answer == "1 and 2"
+        assert agent.memory.steps[-1].model_output_message.tool_calls[0].function.name == "final_answer"
+        assert agent.memory.steps[-1].model_output_message.tool_calls[1].function.name == "test_tool"
 
     @pytest.mark.parametrize(
         "test_case",
@@ -1434,9 +1714,8 @@ class TestToolCallingAgent:
                         function=ChatMessageToolCallFunction(name="test_tool", arguments={"input": "test_value"}),
                     )
                 ],
-                "expected_model_output": "Called Tool: 'test_tool' with arguments: {'input': 'test_value'}",
                 "expected_observations": "Processed: test_value",
-                "expected_final_outputs": [None],
+                "expected_final_outputs": ["Processed: test_value"],
                 "expected_error": None,
             },
             # Case 1: Multiple tool calls
@@ -1453,9 +1732,8 @@ class TestToolCallingAgent:
                         function=ChatMessageToolCallFunction(name="test_tool", arguments={"input": "value2"}),
                     ),
                 ],
-                "expected_model_output": "Called Tool: 'test_tool' with arguments: {'input': 'value1'}\nCalled Tool: 'test_tool' with arguments: {'input': 'value2'}",
                 "expected_observations": "Processed: value1\nProcessed: value2",
-                "expected_final_outputs": [None, None],
+                "expected_final_outputs": ["Processed: value1", "Processed: value2"],
                 "expected_error": None,
             },
             # Case 2: Invalid tool name
@@ -1483,8 +1761,7 @@ class TestToolCallingAgent:
             # Case 4: Empty tool calls list
             {
                 "tool_calls": [],
-                "expected_model_output": None,
-                "expected_observations": None,
+                "expected_observations": "",
                 "expected_final_outputs": [],
                 "expected_error": None,
             },
@@ -1499,8 +1776,7 @@ class TestToolCallingAgent:
                         ),
                     )
                 ],
-                "expected_model_output": "Called Tool: 'final_answer' with arguments: {'answer': 'This is the final answer'}",
-                "expected_observations": None,
+                "expected_observations": "This is the final answer",
                 "expected_final_outputs": ["This is the final answer"],
                 "expected_error": None,
             },
@@ -1523,7 +1799,7 @@ class TestToolCallingAgent:
         # Create chat message with the specified tool calls for process_tool_calls
         chat_message = ChatMessage(role=MessageRole.ASSISTANT, content="", tool_calls=test_case["tool_calls"])
         # Create a memory step for process_tool_calls
-        memory_step = ActionStep(step_number=10, timing="mock_timing")
+        memory_step = ActionStep(step_number=10, timing="mock_timing", model_output="")
 
         # Process tool calls
         if test_case["expected_error"]:
@@ -1531,7 +1807,7 @@ class TestToolCallingAgent:
                 list(agent.process_tool_calls(chat_message, memory_step))
         else:
             final_outputs = list(agent.process_tool_calls(chat_message, memory_step))
-            assert memory_step.model_output == test_case["expected_model_output"]
+            assert memory_step.model_output == ""
             assert memory_step.observations == test_case["expected_observations"]
             assert [
                 final_output.output for final_output in final_outputs if isinstance(final_output, ToolOutput)
@@ -1599,7 +1875,9 @@ class TestCodeAgent:
         assert agent.provide_run_summary is provide_run_summary
         agent.name = "test_agent"
         agent.run = MagicMock(return_value="Test output")
-        agent.write_memory_to_messages = MagicMock(return_value=[{"content": "Test summary"}])
+        agent.write_memory_to_messages = MagicMock(
+            return_value=[ChatMessage(role=MessageRole.ASSISTANT, content="Test summary")]
+        )
 
         result = agent("Test request")
         expected_summary = "Here is the final answer from your managed agent 'test_agent':\nTest output"
@@ -1609,6 +1887,20 @@ class TestCodeAgent:
                 "<summary_of_work>\n\nTest summary\n---\n</summary_of_work>"
             )
         assert result == expected_summary
+
+    def test_code_agent_image_output(self):
+        from PIL import Image
+
+        from smolagents import tool
+
+        @tool
+        def image_generation_tool():
+            """Generate an image"""
+            return Image.new("RGB", (100, 100), color="red")
+
+        agent = CodeAgent(tools=[image_generation_tool], model=FakeCodeModelImageGeneration(), verbosity_level=1)
+        output = agent.run("Make me an image from the latest trend on google trends.")
+        assert isinstance(output, Image.Image)
 
     def test_errors_logging(self):
         class FakeCodeModel(Model):
@@ -1674,12 +1966,15 @@ print("Ok, calculation done!")""")
 
         outputs = [s.model_output for s in actions_steps if s.model_output]
         assert outputs
-        assert all(o.endswith("<end_code>") for o in outputs)
+        assert all(o.endswith("</code>") for o in outputs)
 
         messages = [s.model_output_message for s in actions_steps if s.model_output_message]
         assert messages
-        assert all(m.content.endswith("<end_code>") for m in messages)
+        assert all(m.content.endswith("</code>") for m in messages)
 
+    @pytest.mark.skip(
+        reason="Test is not properly implemented (GH-1255) because fake_tools should have the same name. "
+    )
     def test_change_tools_after_init(self):
         from smolagents import tool
 
@@ -1801,10 +2096,10 @@ print("Ok, calculation done!")""")
         with patch("smolagents.models.InferenceClientModel"):
             agent = CodeAgent.from_dict(
                 agent_dict,
-                additional_authorized_imports=["matplotlib"],
+                additional_authorized_imports=["requests"],
                 executor_kwargs={"max_print_outputs_length": 5_000},
             )
-        assert agent.additional_authorized_imports == ["matplotlib"]
+        assert agent.additional_authorized_imports == ["requests"]
         assert agent.executor_kwargs == {"max_print_outputs_length": 5_000}
 
     def test_custom_final_answer_with_custom_inputs(self):
@@ -2045,7 +2340,6 @@ def test_tool_calling_agents_raises_tool_call_error_being_invoked_with_wrong_arg
     @tool
     def _sample_tool(prompt: str) -> str:
         """Tool that returns same string
-
         Args:
             prompt: The string to return
         Returns:
